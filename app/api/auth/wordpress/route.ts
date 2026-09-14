@@ -1,554 +1,198 @@
 import { NextRequest, NextResponse } from "next/server";
-
 import { getAuth } from "firebase-admin/auth";
-
-import {
-  getFirestore,
-  FieldValue,
-} from "firebase-admin/firestore";
-
-// import { Redis } from "@upstash/redis";
+import { getFirestore, FieldValue } from "firebase-admin/firestore";
 
 import firebaseAdmin from "@/lib/firebase-admin";
+import { serverEnv } from "@/lib/env";
+import { rateLimit } from "@/lib/rate-limit";
 
+/**
+ * Exchanges a one-time WordPress authentication code for a Firebase custom
+ * token.
+ *
+ * Trust boundary: the browser only ever sends us the opaque, single-use
+ * `code`. Every fact about *who* the user is (id, email, name, role) comes
+ * from the server-to-server call to the WordPress REST API below — never
+ * from anything the browser claims. This is what "don't trust user IDs or
+ * emails coming from the browser" means in practice: there is no `email` or
+ * `uid` field this endpoint will accept as input in the first place.
+ */
 
-const WORDPRESS_URL =
-  "https://m11club.com.au";
+function corsHeaders(origin: string | null) {
+  const allowed = serverEnv.allowedEmbedOrigins;
+  const headers = new Headers({
+    "Access-Control-Allow-Methods": "POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type",
+    Vary: "Origin",
+  });
 
+  if (origin && allowed.includes(origin)) {
+    headers.set("Access-Control-Allow-Origin", origin);
+  }
 
-// =========================================================
-// UPSTASH REDIS
-// =========================================================
-
-// const redis = Redis.fromEnv();
-
-
-// =========================================================
-// CORS
-// =========================================================
-
-function corsHeaders() {
-  return {
-    "Access-Control-Allow-Origin":
-      "https://m11club.com.au",
-
-    "Access-Control-Allow-Methods":
-      "POST, OPTIONS",
-
-    "Access-Control-Allow-Headers":
-      "Content-Type",
-
-    "Vary": "Origin",
-  };
+  return headers;
 }
 
+function getClientIp(request: NextRequest) {
+  const forwardedFor = request.headers.get("x-forwarded-for");
+  if (forwardedFor) return forwardedFor.split(",")[0]?.trim() || "unknown";
+  return request.headers.get("x-real-ip")?.trim() || "unknown";
+}
 
-// =========================================================
-// GET CLIENT IP
-// =========================================================
+const CODE_PATTERN = /^[a-fA-F0-9]{64}$/;
 
-// function getClientIp(
-//   request: NextRequest
-// ) {
-//   const forwardedFor =
-//     request.headers.get(
-//       "x-forwarded-for"
-//     );
-
-//   if (forwardedFor) {
-//     return forwardedFor
-//       .split(",")[0]
-//       .trim();
-//   }
-
-//   const realIp =
-//     request.headers.get(
-//       "x-real-ip"
-//     );
-
-//   if (realIp) {
-//     return realIp.trim();
-//   }
-
-//   return "unknown";
-// }
-
-
-// =========================================================
-// POST
-// =========================================================
-
-export async function POST(
-  request: NextRequest
-) {
+export async function POST(request: NextRequest) {
+  const headers = corsHeaders(request.headers.get("origin"));
 
   try {
+    // 1. Basic abuse protection. The code itself is a 256-bit random,
+    //    single-use, short-lived secret, so this isn't the primary defense —
+    //    it just keeps someone from hammering the endpoint.
+    const clientIp = getClientIp(request);
+    const { allowed } = await rateLimit(`auth:${clientIp}`, 20, 60);
 
-    // =======================================================
-    // 1. RATE LIMIT
-    // =======================================================
-
-    // const clientIp =
-    //   getClientIp(request);
-
-    // const rateLimitKey =
-    //   `m11club:auth:${clientIp}`;
-
-    // /*
-    //  * Allow maximum 10 authentication
-    //  * requests per 1 minute per IP.
-    //  *
-    //  * This protects the authentication
-    //  * endpoint from abuse.
-    //  */
-
-    // const requestCount =
-    //   await redis.incr(
-    //     rateLimitKey
-    //   );
-
-    // if (requestCount === 1) {
-    //   await redis.expire(
-    //     rateLimitKey,
-    //     60
-    //   );
-    // }
-
-    // if (requestCount > 10) {
-
-    //   return NextResponse.json(
-    //     {
-    //       success: false,
-    //       error:
-    //         "Too many authentication requests. Please try again later.",
-    //     },
-    //     {
-    //       status: 429,
-    //       headers: {
-    //         ...corsHeaders(),
-
-    //         "Retry-After": "60",
-    //       },
-    //     }
-    //   );
-    // }
-
-
-    // =======================================================
-    // 2. GET AUTHENTICATION CODE
-    // =======================================================
-
-    const body =
-      await request.json();
-
-    const code =
-      body?.code;
-
-
-    if (
-      typeof code !== "string" ||
-      code.length !== 64 ||
-      !/^[a-fA-F0-9]+$/.test(code)
-    ) {
-
+    if (!allowed) {
       return NextResponse.json(
-        {
-          success: false,
-          error:
-            "Invalid authentication code.",
-        },
-        {
-          status: 400,
-          headers:
-            corsHeaders(),
-        }
+        { success: false, error: "Too many requests. Please try again shortly." },
+        { status: 429, headers: { ...Object.fromEntries(headers), "Retry-After": "60" } },
       );
     }
 
+    // 2. Validate the shape of the code before touching WordPress or a DB.
+    const body = await request.json().catch(() => null);
+    const code = body?.code;
 
-    // =======================================================
-    // 3. EXCHANGE CODE WITH WORDPRESS
-    // =======================================================
-
-    const wordpressResponse =
-      await fetch(
-        `${WORDPRESS_URL}/wp-json/m11club/v1/exchange-auth-code`,
-        {
-          method: "POST",
-
-          headers: {
-            "Content-Type":
-              "application/json",
-          },
-
-          body: JSON.stringify({
-            code,
-          }),
-
-          cache: "no-store",
-        }
+    if (typeof code !== "string" || !CODE_PATTERN.test(code)) {
+      return NextResponse.json(
+        { success: false, error: "Invalid authentication code." },
+        { status: 400, headers },
       );
+    }
 
+    // 3. Exchange the code with WordPress. This is the only source of truth
+    //    for user identity — the browser's request body is never trusted.
+    const wordpressResponse = await fetch(
+      `${serverEnv.wordpressUrl}/wp-json/m11club/v1/exchange-auth-code`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ code }),
+        cache: "no-store",
+      },
+    );
 
-    let wordpressData;
-
-
+    let wordpressData: any;
     try {
-
-      wordpressData =
-        await wordpressResponse.json();
-
+      wordpressData = await wordpressResponse.json();
     } catch {
-
       return NextResponse.json(
-        {
-          success: false,
-          error:
-            "WordPress returned an invalid response.",
-        },
-        {
-          status: 502,
-          headers:
-            corsHeaders(),
-        }
+        { success: false, error: "WordPress returned an invalid response." },
+        { status: 502, headers },
       );
     }
 
-
-    // =======================================================
-    // 4. CHECK WORDPRESS RESPONSE
-    // =======================================================
-
-    if (
-      !wordpressResponse.ok ||
-      !wordpressData?.success
-    ) {
-
+    if (!wordpressResponse.ok || !wordpressData?.success) {
       return NextResponse.json(
         {
           success: false,
-
-          error:
-            wordpressData?.message ||
-            "WordPress authentication failed.",
+          error: wordpressData?.message || "WordPress authentication failed.",
         },
-        {
-          status:
-            wordpressResponse.status ||
-            401,
-
-          headers:
-            corsHeaders(),
-        }
+        { status: wordpressResponse.status || 401, headers },
       );
     }
 
+    const user = wordpressData.user;
 
-    const user =
-      wordpressData.user;
-
-
-    if (
-      !user ||
-      !user.id
-    ) {
-
+    if (!user?.id) {
       return NextResponse.json(
-        {
-          success: false,
-
-          error:
-            "WordPress user information is missing.",
-        },
-        {
-          status: 401,
-
-          headers:
-            corsHeaders(),
-        }
+        { success: false, error: "WordPress user information is missing." },
+        { status: 401, headers },
       );
     }
 
-
-    // =======================================================
-    // 5. GET USER NAME
-    // =======================================================
-
-    const firstName =
-      typeof user.firstName ===
-      "string"
-        ? user.firstName.trim()
-        : "";
-
-
-    const lastName =
-      typeof user.lastName ===
-      "string"
-        ? user.lastName.trim()
-        : "";
-
-
+    // 4. Normalize trusted fields.
+    const firstName = typeof user.firstName === "string" ? user.firstName.trim() : "";
+    const lastName = typeof user.lastName === "string" ? user.lastName.trim() : "";
     const fullName =
-      [firstName, lastName]
-        .filter(Boolean)
-        .join(" ") ||
+      [firstName, lastName].filter(Boolean).join(" ") || user.name || user.email || "User";
+    const role: "admin" | "user" = user.role === "admin" ? "admin" : "user";
 
-      user.name ||
+    // Stable, deterministic Firebase UID derived from the WordPress user id.
+    const firebaseUid = `wp_${user.id}`;
+    const firebaseAuth = getAuth(firebaseAdmin);
 
-      user.email ||
-
-      "User";
-
-
-    // =======================================================
-    // 6. GET USER ROLE
-    // =======================================================
-
-    /*
-     * Only "admin" or "user"
-     * is allowed.
-     */
-
-    const role =
-      user.role === "admin"
-        ? "admin"
-        : "user";
-
-
-    // =======================================================
-    // 7. STABLE FIREBASE UID
-    // =======================================================
-
-    /*
-     * Example:
-     *
-     * WordPress user ID = 169
-     *
-     * Firebase UID = wp_169
-     */
-
-    const firebaseUid =
-      `wp_${user.id}`;
-
-
-    const firebaseAuth =
-      getAuth(firebaseAdmin);
-
-
-    // =======================================================
-    // 8. CREATE OR UPDATE FIREBASE USER
-    // =======================================================
-
+    // 5. Create or update the mirrored Firebase user.
     try {
-
-      // Check if Firebase user
-      // already exists
-
-      await firebaseAuth.getUser(
-        firebaseUid
-      );
-
-
-      // User exists →
-      // update information
-
-      await firebaseAuth.updateUser(
-        firebaseUid,
-        {
-          email:
-            user.email ||
-            undefined,
-
-          displayName:
-            fullName,
-        }
-      );
-
-    } catch (
-      error: any
-    ) {
-
-      if (
-        error?.code ===
-        "auth/user-not-found"
-      ) {
-
-        // User doesn't exist →
-        // create Firebase user
-
-        await firebaseAuth.createUser(
-          {
-            uid: firebaseUid,
-
-            email:
-              user.email ||
-              undefined,
-
-            displayName:
-              fullName,
-          }
-        );
-
+      await firebaseAuth.getUser(firebaseUid);
+      await firebaseAuth.updateUser(firebaseUid, {
+        email: user.email || undefined,
+        displayName: fullName,
+      });
+    } catch (error: any) {
+      if (error?.code === "auth/user-not-found") {
+        await firebaseAuth.createUser({
+          uid: firebaseUid,
+          email: user.email || undefined,
+          displayName: fullName,
+        });
       } else {
-
         throw error;
       }
     }
 
+    // 6. Custom claims are the trusted, tamper-proof channel for role/name
+    //    info. They're embedded in every ID token the client gets afterwards
+    //    and are verified server-side — the client can read them but not set
+    //    or forge them.
+    await firebaseAuth.setCustomUserClaims(firebaseUid, {
+      wordpressUserId: String(user.id),
+      firstName,
+      lastName,
+      fullName,
+      role,
+    });
 
-    // =======================================================
-    // 9. STORE TRUSTED FIREBASE CLAIMS
-    // =======================================================
-
-    await firebaseAuth
-      .setCustomUserClaims(
-        firebaseUid,
-        {
-          wordpressUserId:
-            String(user.id),
-
-          firstName,
-
-          lastName,
-
-          fullName,
-
-          role,
-        }
-      );
-
-
-    // =======================================================
-    // 10. STORE USER PROFILE
-    // =======================================================
-
-    const db =
-      getFirestore(
-        firebaseAdmin
-      );
-
-
+    // 7. Mirror a profile document for convenience (admin dashboards, etc).
+    const db = getFirestore(firebaseAdmin);
     await db
       .collection("users")
       .doc(firebaseUid)
       .set(
         {
-          wordpressUserId:
-            String(user.id),
-
-          email:
-            user.email || "",
-
+          wordpressUserId: String(user.id),
+          email: user.email || "",
           firstName,
-
           lastName,
-
-          displayName:
-            fullName,
-
+          displayName: fullName,
           role,
-
-          updatedAt:
-            FieldValue.serverTimestamp(),
+          updatedAt: FieldValue.serverTimestamp(),
         },
-        {
-          merge: true,
-        }
+        { merge: true },
       );
 
-
-    // =======================================================
-    // 11. CREATE FIREBASE CUSTOM TOKEN
-    // =======================================================
-
-    const firebaseToken =
-      await firebaseAuth
-        .createCustomToken(
-          firebaseUid
-        );
-
-
-    console.log(
-      "Firebase authentication successful:",
-      firebaseUid,
-      role
-    );
-
-
-    // =======================================================
-    // 12. SEND RESPONSE
-    // =======================================================
+    const firebaseToken = await firebaseAuth.createCustomToken(firebaseUid);
 
     return NextResponse.json(
       {
         success: true,
-
-        user: {
-          id: user.id,
-
-          email:
-            user.email,
-
-          firstName,
-
-          lastName,
-
-          name:
-            fullName,
-
-          role,
-        },
-
+        user: { id: user.id, email: user.email, firstName, lastName, name: fullName, role },
         firebaseToken,
       },
-      {
-        status: 200,
-
-        headers:
-          corsHeaders(),
-      }
+      { status: 200, headers },
     );
-
-
   } catch (error) {
-
-    console.error(
-      "WordPress → Firebase authentication error:",
-      error
-    );
-
+    console.error("WordPress -> Firebase authentication error:", error);
 
     return NextResponse.json(
-      {
-        success: false,
-
-        error:
-          "Authentication service temporarily unavailable.",
-      },
-      {
-        status: 500,
-
-        headers:
-          corsHeaders(),
-      }
+      { success: false, error: "Authentication service temporarily unavailable." },
+      { status: 500, headers },
     );
   }
 }
 
-
-// =========================================================
-// OPTIONS / CORS
-// =========================================================
-
-export async function OPTIONS() {
-
-  return new NextResponse(
-    null,
-    {
-      status: 204,
-
-      headers:
-        corsHeaders(),
-    }
-  );
+export async function OPTIONS(request: NextRequest) {
+  return new NextResponse(null, {
+    status: 204,
+    headers: corsHeaders(request.headers.get("origin")),
+  });
 }

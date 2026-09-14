@@ -1,14 +1,16 @@
-import { cert, getApps, initializeApp } from "firebase-admin/app";
+import "server-only";
 
-const firebaseAdmin =
-  getApps().length === 0
-    ? initializeApp({
-        credential: cert({
-          projectId: process.env.FIREBASE_PROJECT_ID,
-          clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-          privateKey: process.env.FIREBASE_PRIVATE_KEY?.replace(/\\n/g, "\n"),
-        }),
-      })
-    : getApps()[0];
+import { cert, getApps, initializeApp, type App } from "firebase-admin/app";
+import { serverEnv } from "@/lib/env";
+
+/**
+ * `server-only` makes it a build-time error to import this module from any
+ * client component, which is the main guardrail against accidentally
+ * bundling the service account credentials into client JavaScript.
+ */
+const existingApps = getApps();
+
+const firebaseAdmin: App =
+  existingApps[0] ?? initializeApp({ credential: cert(serverEnv.firebaseAdmin) });
 
 export default firebaseAdmin;

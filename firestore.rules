@@ -1,0 +1,61 @@
+rules_version = '2';
+
+// =============================================================================
+// M11Club Chat — Firestore Security Rules
+// =============================================================================
+//
+// Trust model:
+// - `role` is a Firebase custom claim, set only by the Admin SDK in
+//   /api/auth/wordpress after verifying the user against WordPress. A
+//   client can never set or change its own claims, so `request.auth.token.role`
+//   is safe to branch on here.
+// - New messages are written by the server (/api/chat/message) using the
+//   Admin SDK, which bypasses these rules entirely. Rules below deliberately
+//   deny client-side `create`/`update` on messages so the API route (with its
+//   validation and rate limiting) is the only way to post — a compromised or
+//   modified client can't write directly to Firestore instead.
+// =============================================================================
+
+function isSignedIn() {
+  return request.auth != null;
+}
+
+function isAdmin() {
+  return isSignedIn() && request.auth.token.role == 'admin';
+}
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    match /groups/{groupId} {
+      allow read: if isSignedIn();
+      allow write: if false; // group metadata is managed server-side only
+
+      match /messages/{messageId} {
+        // Any signed-in (WordPress-authenticated) user can read the group.
+        allow read: if isSignedIn();
+
+        // All message creation goes through /api/chat/message (Admin SDK),
+        // which validates length, rate-limits, and stamps a trusted sender.
+        allow create: if false;
+        allow update: if false;
+
+        // Only admins (WordPress "administrator" role, mirrored into the
+        // custom claim at auth time) may delete a message.
+        allow delete: if isAdmin();
+      }
+    }
+
+    match /users/{userId} {
+      // Users may read their own mirrored profile; admins may read any.
+      allow read: if isSignedIn() && (request.auth.uid == userId || isAdmin());
+      // Profiles are written only by /api/auth/wordpress via the Admin SDK.
+      allow write: if false;
+    }
+
+    // Default deny for anything not explicitly matched above.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
