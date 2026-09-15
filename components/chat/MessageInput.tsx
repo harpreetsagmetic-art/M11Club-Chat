@@ -34,10 +34,10 @@ export function MessageInput({
     <div className="flex shrink-0 items-center gap-2 border-t border-border px-3 py-3">
       <button
         type="button"
-        disabled
+
         aria-label="Attachments (coming soon)"
         title="Attachments coming soon"
-        className="flex h-10 w-10 shrink-0 cursor-not-allowed items-center justify-center rounded-full bg-surface-raised text-text-muted"
+        className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-surface-raised text-text-muted"
       >
         <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden>
           <path
