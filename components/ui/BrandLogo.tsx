@@ -23,7 +23,7 @@ export function BrandLogo({
       src={LOGO_URL}
       alt="M11Club"
       className={cn(
-        "shrink-0 rounded-full object-cover ring-1 ring-border",
+        "shrink-0 rounded-full object-contain  bg-[#FFFFFF33] border border-[#FFFFFF52] px-[6px]",
         sizeClasses[size],
         glow && "animate-brand-glow",
         className,
